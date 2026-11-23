@@ -1,0 +1,18 @@
+- Komunikacja:
+    - Czat:
+        href: /chat/
+        description: Wejdź do wspólnego pokoju
+        siteMonitor: http://chat:8765/healthz
+
+- Infrastruktura:
+    - Cloudflare Zero Trust:
+        href: https://one.dash.cloudflare.com/
+        description: Zarządzanie dostępem i tunelami
+        icon: cloudflare.png
+# Jeśli korzystasz z Portainera lub panelu routera, dodaj tutaj własne adresy.
+#   - Portainer:
+#       href: https://portainer.example.org/
+#       icon: portainer.png
+#   - Router:
+#       href: http://192.168.1.1/
+#       icon: router.png

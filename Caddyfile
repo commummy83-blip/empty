@@ -1,0 +1,9 @@
+:8080 {
+	redir /chat /chat/ 308
+	handle_path /chat/* {
+		reverse_proxy chat:8765
+	}
+	handle {
+		reverse_proxy homepage:3000
+	}
+}

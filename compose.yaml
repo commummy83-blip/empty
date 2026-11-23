@@ -1,0 +1,43 @@
+name: secure-chat-hub
+services:
+  gateway:
+    image: caddy:2.11.9-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LOCAL_PORT:-8080}:8080"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      homepage:
+        condition: service_started
+      chat:
+        condition: service_healthy
+
+  homepage:
+    image: ghcr.io/gethomepage/homepage:v2.8.0
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      HOMEPAGE_ALLOWED_HOSTS: "localhost:${LOCAL_PORT:-8080},127.0.0.1:${LOCAL_PORT:-8080},${PUBLIC_HOST:-localhost}"
+    volumes:
+      - homepage-data:/app/config
+      - ./homepage/config/services.yaml:/app/config/services.yaml:ro
+      - ./homepage/config/settings.yaml:/app/config/settings.yaml:ro
+      - ./homepage/config/widgets.yaml:/app/config/widgets.yaml:ro
+      - ./homepage/config/bookmarks.yaml:/app/config/bookmarks.yaml:ro
+
+  chat:
+    build: ./chat
+    restart: unless-stopped
+    environment:
+      CHAT_PASSWORD: ${CHAT_PASSWORD:?Ustaw CHAT_PASSWORD w pliku .env}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=2).close()"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  homepage-data:
