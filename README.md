@@ -32,7 +32,13 @@ Potrzebujesz Docker Engine z wtyczką Compose v2.20 lub nowszą albo Docker Desk
 
    Oczekiwana odpowiedź to `{"status":"ok"}`. Jeśli port 8080 jest zajęty, zmień `LOCAL_PORT` w `.env`, ponownie wykonaj `docker compose up -d` i użyj nowego portu w adresie panelu.
 
-4. Otwórz [panel lokalny](http://127.0.0.1:8080/), wybierz **Czat**, wpisz pseudonim i hasło. W drugim oknie użyj innego pseudonimu. Wyślij wiadomość z pierwszego okna i sprawdź jej odbiór w drugim. Kliknij **← Panel**, wróć do pokoju i sprawdź historię.
+4. Otwórz [panel lokalny](http://127.0.0.1:8080/), wybierz **Czat**, wpisz pseudonim i hasło instalacji, a następnie kliknij **Utwórz rozmowę**. Możesz zaznaczyć **Zakończ rozmowę po 5 minutach** przed utworzeniem pokoju. Skopiuj cały link zaproszenia, łącznie z częścią po `#`. Przekaż link uczestnikowi, a hasło podaj osobnym kanałem. Druga osoba otwiera link, podaje swój pseudonim i hasło, a potem wybiera **Dołącz do rozmowy**. Adres z `127.0.0.1` służy do testów na jednym komputerze. Do rozmowy zdalnej utwórz zaproszenie na publicznym adresie HTTPS.
+
+### Szyfrowanie i wygasanie
+
+Przeglądarka twórcy generuje losowy 256-bitowy klucz pokoju. Web Crypto szyfruje każdą wiadomość algorytmem AES-GCM z losowym 96-bitowym IV. Klucz pozostaje we fragmencie linku. Serwer sprawdza wspólne hasło instalacji i identyfikator pokoju, zna pseudonimy i czas wysłania oraz przechowuje zaszyfrowane wiadomości. Każdy uczestnik posiada wspólny klucz. Rozwiązanie zakłada zaufanie do aplikacji dostarczanej przeglądarce i urządzeń uczestników. Nie zapewnia indywidualnych podpisów ani poufności dawnych wiadomości po przejęciu klucza.
+
+W trybie czasowym pokój wygasa po 5 minutach od utworzenia, także gdy wszyscy go opuszczą. Serwer usuwa historię i unieważnia zaproszenie, a otwarte karty czyszczą widok rozmowy. Kopie zapisane przez uczestników pozostają u nich. Kolejna rozmowa ma nowy link i klucz. W trybie zwykłym zaproszenie działa do restartu usługi. Aby wrócić do tej samej rozmowy, zachowaj jej link.
 
 Port wejściowy jest przypisany do `127.0.0.1`. Na zdalnym serwerze możesz sprawdzić panel ze swojego komputera przez `ssh -L 8080:127.0.0.1:8080 użytkownik@serwer`, a potem otworzyć ten sam adres lokalny.
 

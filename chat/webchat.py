@@ -20,6 +20,7 @@ Run:       python3 webchat.py                      # random password, tailnet on
 """
 from __future__ import annotations
 
+import base64
 import argparse
 import asyncio
 from html import escape
@@ -47,6 +48,7 @@ except ImportError:
 # ----------------------------------------------------------------------------
 # Limits
 # ----------------------------------------------------------------------------
+ROOM_DURATION = 300
 MAX_MSG_LEN = 2000          # characters per chat message
 MAX_NAME_LEN = 24
 HISTORY_SIZE = 100          # messages replayed to new joiners
@@ -123,8 +125,19 @@ class Room:
 # ----------------------------------------------------------------------------
 # Web app
 # ----------------------------------------------------------------------------
-def build_app(room: Room, title: str, *, dashboard: bool = False) -> FastAPI:
+def build_app(auth: Room, title: str, *, dashboard: bool = False) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    rooms = {}
+
+    async def expire(room_id, room):
+        rooms.pop(room_id, None)
+        room.history.clear()
+        for client in list(room.clients):
+            try:
+                await client.ws.close(code=4001, reason="Rozmowa wygasła")
+            except (RuntimeError, OSError):
+                pass
 
     @app.middleware("http")
     async def security_headers(request, call_next):
@@ -168,13 +181,30 @@ def build_app(room: Room, title: str, *, dashboard: bool = False) -> FastAPI:
             await ws.send_text(json.dumps({"type": "error", "text": reason}))
             await ws.close(code=1008)
 
-        if room.locked_out():
+        if auth.locked_out():
             return await reject("Too many failed logins. Try again in a minute.")
-        if not room.check_password(password):
+        if not auth.check_password(password):
             await asyncio.sleep(1.5)  # slow down brute force
             return await reject("Wrong password.")
         if not NAME_RE.match(name):
             return await reject(f"Name must be 1-{MAX_NAME_LEN} letters, digits, spaces, . _ -")
+        if msg.get("type") == "create":
+            if len(rooms) >= 1024:
+                return await reject("Limit rozmów został osiągnięty.")
+            room_id = secrets.token_urlsafe(24)
+            room = Room(password)
+            rooms[room_id] = room
+            room.deadline = None
+            if msg.get("temporary") is True:
+                room.deadline = time.monotonic() + ROOM_DURATION
+                asyncio.get_running_loop().call_later(
+                    ROOM_DURATION, lambda: asyncio.create_task(expire(room_id, room))
+                )
+        else:
+            room_id = msg.get("room")
+            room = rooms.get(room_id) if isinstance(room_id, str) else None
+            if room is None or (room.deadline is not None and time.monotonic() >= room.deadline):
+                return await reject("Zaproszenie jest nieprawidłowe lub rozmowa wygasła.")
         if room.name_taken(name):
             return await reject("That name is already in use.")
 
@@ -182,6 +212,8 @@ def build_app(room: Room, title: str, *, dashboard: bool = False) -> FastAPI:
         room.clients.add(client)
         try:
             await ws.send_text(json.dumps({"type": "welcome", "name": name,
+                                           "room": room_id,
+                                           "remaining": None if room.deadline is None else max(0, room.deadline - time.monotonic()),
                                            "history": list(room.history)}))
             await room.broadcast({"type": "system", "text": f"{name} joined", "ts": time.time()})
             await room.presence()
@@ -189,18 +221,21 @@ def build_app(room: Room, title: str, *, dashboard: bool = False) -> FastAPI:
             while True:
                 raw = await ws.receive_text()
                 try:
-                    text = str(json.loads(raw).get("text", "")).strip()
-                except Exception:
+                    packet = json.loads(raw)
+                    iv = base64.b64decode(packet["iv"], validate=True)
+                    ciphertext = base64.b64decode(packet["ciphertext"], validate=True)
+                    if len(iv) != 12 or not 16 < len(ciphertext) <= MAX_MSG_LEN * 4 + 16:
+                        continue
+                except (ValueError, TypeError, KeyError):
                     continue
-                if not text:
-                    continue
-                if len(text) > MAX_MSG_LEN:
-                    text = text[:MAX_MSG_LEN]
+                if room.deadline is not None and time.monotonic() >= room.deadline:
+                    break
                 if not client.rate_ok():
                     await ws.send_text(json.dumps({"type": "system", "ts": time.time(),
                                                    "text": "Slow down - message dropped."}))
                     continue
-                await room.broadcast({"type": "msg", "name": name, "text": text, "ts": time.time()})
+                await room.broadcast({"type": "msg", "name": name, "iv": packet["iv"],
+                                      "ciphertext": packet["ciphertext"], "ts": time.time()})
         except WebSocketDisconnect:
             pass
         except Exception as e:
@@ -381,14 +416,15 @@ INDEX_HTML = r"""<!doctype html>
 <div class="center" id="login">
   {{PANEL}}<h1>{{TITLE}}</h1>
   <form id="lf">
-    <label for="name">Your name</label><input id="name" maxlength="24" autocomplete="nickname" required>
-    <label for="pw">Room password</label><input id="pw" type="password" autocomplete="current-password" required>
-    <div style="height:14px"></div><button>Join</button>
+    <label for="name">Pseudonim</label><input id="name" maxlength="24" autocomplete="nickname" required>
+    <label for="pw">Hasło pokoju</label><input id="pw" type="password" autocomplete="current-password" required>
+    <div style="height:14px"></div><label id="ttl"><input type="checkbox" id="temporary"> Zakończ rozmowę po 5 minutach</label><button id="join">Utwórz rozmowę</button>
     <div class="err" id="err"></div>
   </form>
 </div>
 <div id="chat">
   <header>{{PANEL}}<strong>{{TITLE}}</strong><span id="users"></span></header>
+  <div id="inviteBox"><label for="invite">Link zaproszenia · hasło przekaż osobno</label><input readonly id="invite" onclick="this.select()"><span id="expiry"></span></div>
   <div id="log"></div>
   <form id="send"><input id="msg" maxlength="2000" autocomplete="off" placeholder="Type a message…"><button>Send</button></form>
 </div>
@@ -411,30 +447,95 @@ function add(m){
   if (stick) log.scrollTop = log.scrollHeight;
 }
 
-$('lf').onsubmit = e => {
-  e.preventDefault(); $('err').textContent = '';
-  const endpoint = new URL('ws', location.href);
-  endpoint.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(endpoint);
-  ws.onopen = () => ws.send(JSON.stringify({type:'auth', name:$('name').value, password:$('pw').value}));
-  ws.onmessage = ev => {
-    const m = JSON.parse(ev.data);
-    if (m.type === 'error'){ $('err').textContent = m.text; return; }
-    if (m.type === 'welcome'){
-      me = m.name; $('pw').value = '';
-      $('login').style.display = 'none'; $('chat').style.display = 'flex';
-      m.history.forEach(add); $('msg').focus(); return;
-    }
-    if (m.type === 'users'){ $('users').textContent = m.users.length + ' online: ' + m.users.join(', '); return; }
-    add(m);
-  };
-  ws.onclose = () => { if (me){ add({type:'system', ts:Date.now()/1000, text:'Disconnected. Reload the page to rejoin.'}); me = null; } };
-};
-
-$('send').onsubmit = e => {
+const fragment = location.hash.slice(1);
+const invite = /^([A-Za-z0-9_-]{32})\.([A-Za-z0-9_-]{43})$/.exec(fragment);
+const encode = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes)));
+const decode = value => Uint8Array.from(atob(value), ch => ch.charCodeAt(0));
+const encoder = new TextEncoder();
+let key, roomId, ended = false, deadline = null;
+if (fragment) {
+  $('ttl').hidden = true;
+  $('join').textContent = 'Dołącz do rozmowy';
+}
+function finish(){
+  ended = true;
+  key = null;
+  $('chat').replaceChildren();
+  $('chat').textContent = 'Rozmowa wygasła.';
+  ws.close();
+}
+function expired(){
+  if (deadline !== null && Date.now() >= deadline && !ended) finish();
+  return ended;
+}
+document.addEventListener('visibilitychange', expired);
+async function display(m){
+  if (expired()) return;
+  if (m.type === 'msg') {
+    try {
+      const bytes = await crypto.subtle.decrypt(
+        {name:'AES-GCM', iv:decode(m.iv), additionalData:encoder.encode(roomId + '/' + m.name)},
+        key, decode(m.ciphertext));
+      m.text = new TextDecoder().decode(bytes);
+    } catch { m.text = 'Nie udało się uwierzytelnić wiadomości.'; }
+  }
+  if (!expired()) add(m);
+}
+$('lf').onsubmit = async e => {
   e.preventDefault();
-  const v = $('msg').value.trim();
-  if (v && ws && ws.readyState === 1){ ws.send(JSON.stringify({text:v})); $('msg').value=''; }
+  $('join').disabled = true;
+  try {
+    if (!globalThis.crypto?.subtle) throw Error('Otwórz czat przez HTTPS lub localhost.');
+    if (fragment && !invite) throw Error('Nieprawidłowy link zaproszenia.');
+    const rawKey = invite ? decode(invite[2].replace(/-/g,'+').replace(/_/g,'/')) : crypto.getRandomValues(new Uint8Array(32));
+    key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt','decrypt']);
+    const endpoint = new URL('ws', location.href);
+    endpoint.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(endpoint);
+    $('err').textContent = '';
+    ws.onopen = () => ws.send(JSON.stringify({type:invite?'join':'create', room:invite?.[1],
+      temporary:$('temporary').checked, password:$('pw').value, name:$('name').value}));
+    let queue = Promise.resolve();
+    ws.onmessage = ev => {
+      const m = JSON.parse(ev.data);
+      if (m.type === 'error') { $('err').textContent = m.text; return; }
+      if (m.type === 'welcome'){
+        me = m.name; roomId = m.room;
+        const url = new URL(location.href);
+        url.hash = roomId + '.' + encode(rawKey).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+        history.replaceState(null,'',url);
+        $('invite').value = url.href;
+        $('pw').value = '';
+        $('login').style.display = 'none'; $('chat').style.display = 'flex';
+        if (m.remaining !== null){
+          deadline = Date.now() + m.remaining*1000;
+          $('expiry').textContent = 'Koniec rozmowy: ' + new Date(deadline).toLocaleTimeString();
+          setTimeout(finish, m.remaining*1000);
+        }
+        for (const entry of m.history) queue = queue.then(()=>display(entry));
+      } else if (m.type === 'users'){
+        if (!ended) $('users').textContent = m.users.join(', ');
+      } else queue = queue.then(()=>display(m));
+    };
+    ws.onclose = ev => {
+      if (ev.code === 4001 && !ended) finish();
+      if (ended) return;
+      if (me) { $('send').hidden = true; $('users').textContent = 'Rozłączono. Odśwież stronę.'; }
+      else { $('join').disabled = false; if (!$('err').textContent) $('err').textContent = 'Brak połączenia.'; }
+    };
+  } catch (err) { $('err').textContent = err.message; $('join').disabled = false; }
+};
+$('send').onsubmit = async e => {
+  e.preventDefault();
+  const value = $('msg').value.trim();
+  if (!value || expired() || ws.readyState !== WebSocket.OPEN) return;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    {name:'AES-GCM', iv, additionalData:encoder.encode(roomId + '/' + me)}, key, encoder.encode(value));
+  if (!expired() && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({iv:encode(iv), ciphertext:encode(ciphertext)}));
+    if ($('msg').value.trim() === value) $('msg').value='';
+  }
 };
 </script>
 </body></html>
